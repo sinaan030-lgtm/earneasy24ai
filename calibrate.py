@@ -53,6 +53,12 @@ def main() -> None:
     input_box = capture_point("3. Center of the answer input field")
     submit_button = capture_point("4. Center of the Submit button")
 
+    calibrate_play = input("Do you want to calibrate the Macro Recorder Play button? (y/n): ").strip().lower()
+    if calibrate_play in ("y", "yes"):
+        play_button = capture_point("5. Center of the Macro Recorder Play button")
+    else:
+        play_button = (0, 0)
+
     capture_region = region_from_points(captcha_top_left, captcha_bottom_right)
 
     print()
@@ -60,8 +66,13 @@ def main() -> None:
     print(f"CAPTURE_REGION={format_tuple(capture_region)}")
     print(f"INPUT_BOX={format_tuple(input_box)}")
     print(f"SUBMIT_BUTTON={format_tuple(submit_button)}")
+    if play_button != (0, 0):
+        print(f"PLAY_BUTTON={format_tuple(play_button)}")
+    else:
+        print("PLAY_BUTTON=0,0")
 
 
 if __name__ == "__main__":
     main()
+
 

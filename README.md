@@ -24,7 +24,6 @@ OCR_MODE=accurate
 NVIDIA_API_KEY=
 
 DUPLICATE_TEXT_WINDOW_SECONDS=10.0
-SOLVE_MATH_CHALLENGES=true
 ```
 
 OCR modes:
@@ -47,16 +46,35 @@ prints the exact `.env` lines to use.
 
 ## Run
 
+You can run the bot in either GUI mode (recommended) or CLI terminal mode.
+
+### GUI Mode (Recommended)
+Launch the visual control panel (styled like Macro Recorder):
+```powershell
+python gui.py
+```
+**Features:**
+- **Toolbar:** Click **Play** to start, **Stop** to stop, or calibrate visually.
+- **Visual Snipping:** Click **Region** to open a semi-transparent screen overlay, then click and drag a rectangle over the CAPTCHA area.
+- **Click Calibration:** Click **Input**, **Submit**, or **Play Btn** to select coordinates directly by clicking on your screen.
+- **Live Action Log:** View detections and coordinate updates in real time.
+- **Config Editor:** Adjust delays, confidence levels, and API credentials from the settings sidebar and save directly to `.env`.
+
+### CLI Mode
+To run inside the terminal:
 ```powershell
 python bot.py
 ```
 
-Hotkeys:
+---
 
-- `F6`: set input box to the current mouse position
-- `F7`: set submit button to the current mouse position
-- `F8`: start the bot
-- `F9`: stop the bot
-- `F12`: print the current mouse/config positions
+## Hotkeys
 
-Once `F8` is pressed, the bot runs without manual text entry.
+Global hotkeys work in both CLI and GUI modes:
+- `F6`: Set input box to the current mouse position
+- `F7`: Set submit button to the current mouse position
+- `F10`: Set play button (for Macro Recorder) to the current mouse position
+- `F8`: Start the bot
+- `F9`: Stop the bot
+- `F12`: Print the current mouse/config positions
+

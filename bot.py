@@ -20,9 +20,11 @@ import requests
 DEFAULT_CAPTURE_REGION = (700, 193, 478, 205)  # x, y, width, height
 DEFAULT_INPUT_BOX = (100, 325)
 DEFAULT_SUBMIT_BUTTON = (200, 400)
+DEFAULT_PLAY_BUTTON = (0, 0)
+DEFAULT_STATUS_POINT = (0, 0)
 
 DEFAULT_NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-DEFAULT_NVIDIA_MODEL = "meta/llama-3.2-11b-vision-instruct"
+DEFAULT_NVIDIA_MODEL = "nvidia/llama-3.1-nemotron-nano-vl-8b-v1"
 
 OCR_MODE_ALIASES = {
     "ai": "nvidia",
@@ -55,10 +57,14 @@ class Config:
     min_seconds_between_submissions: float
     paste_delay_seconds: float
     submit_delay_seconds: float
+    play_delay_seconds: float
     clear_input_before_paste: bool
-    solve_math_challenges: bool
     pyautogui_pause: float
     pyautogui_failsafe: bool
+    min_captcha_length: int
+    max_captcha_length: int
+    character_replacements: dict[str, str]
+    status_point: tuple[int, int]
 
 
 def load_dotenv() -> None:
@@ -153,10 +159,19 @@ def parse_ocr_mode(value: str) -> str:
 
 
 def read_config() -> Config:
+    import json
+    replacements_str = env_str("CHARACTER_REPLACEMENTS_JSON", "")
+    replacements = {}
+    if replacements_str:
+        try:
+            replacements = json.loads(replacements_str)
+        except Exception as e:
+            print(f"Error parsing CHARACTER_REPLACEMENTS_JSON: {e}")
+
     return Config(
         capture_region=parse_int_tuple("CAPTURE_REGION", 4, DEFAULT_CAPTURE_REGION),
         loop_delay_seconds=env_float("LOOP_DELAY_SECONDS", 0.15),
-        change_cooldown_seconds=env_float("CHANGE_COOLDOWN_SECONDS", 0.7),
+        change_cooldown_seconds=env_float("CHANGE_COOLDOWN_SECONDS", 10.0),
         post_change_settle_seconds=env_float("POST_CHANGE_SETTLE_SECONDS", 0.15),
         process_initial_frame=env_bool("PROCESS_INITIAL_FRAME", True),
         ocr_mode=parse_ocr_mode(env_str("OCR_MODE", env_str("OCR_ENGINE", "hybrid"))),
@@ -183,10 +198,14 @@ def read_config() -> Config:
         ),
         paste_delay_seconds=env_float("PASTE_DELAY_SECONDS", 0.05),
         submit_delay_seconds=env_float("SUBMIT_DELAY_SECONDS", 0.05),
+        play_delay_seconds=env_float("PLAY_DELAY_SECONDS", 1.0),
         clear_input_before_paste=env_bool("CLEAR_INPUT_BEFORE_PASTE", True),
-        solve_math_challenges=env_bool("SOLVE_MATH_CHALLENGES", True),
         pyautogui_pause=env_float("PYAUTOGUI_PAUSE", 0.02),
         pyautogui_failsafe=env_bool("PYAUTOGUI_FAILSAFE", True),
+        min_captcha_length=env_int("MIN_CAPTCHA_LENGTH", 6),
+        max_captcha_length=env_int("MAX_CAPTCHA_LENGTH", 12),
+        character_replacements=replacements,
+        status_point=parse_int_tuple("STATUS_POINT", 2, DEFAULT_STATUS_POINT),
     )
 
 
@@ -212,63 +231,39 @@ def image_to_png_data_url(image: Any) -> str:
 
 def clean_model_output(text: str) -> str:
     text = text.strip()
+    # Remove markdown formatting characters (bold, italics, headers, etc.)
+    text = text.replace("**", "").replace("__", "").replace("*", "").replace("_", "")
+    
+    # Strip common code blocks
     text = re.sub(r"^```(?:text)?", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"```$", "", text).strip()
-    text = re.sub(r"^(text|answer)\s*:\s*", "", text, flags=re.IGNORECASE).strip()
+    
+    # Strip common prefixes like "Answer:", "Captcha:", "Text:", "Result:", "Value:", etc.
+    # including "The answer is:", "The captcha is:"
+    prefix_pattern = r"^(?:the\s+)?(?:captcha|answer|text|value|solution|challenge|result)(?:\s+is)?\s*[:=-]\s*"
+    text = re.sub(prefix_pattern, "", text, flags=re.IGNORECASE).strip()
+    
+    # Strip quotes, backticks, and extra spaces again
     text = text.strip("\"'` ")
 
-    if text.lower() in {"none", "no text", "no visible text", "n/a"}:
+    lower_text = text.lower()
+    if any(phrase in lower_text for phrase in ["sorry", "cannot read", "unable to", "don't see", "no text", "clear text", "i see", "loading spinner", "blinking cursor"]):
+        return ""
+
+    if lower_text in {"none", "no text", "no visible text", "n/a", ""}:
         return ""
 
     return text
 
 
-def clean_detected_text(text: str) -> str:
+def clean_detected_text(text: str, replacements: dict[str, str] = None) -> str:
     text = clean_model_output(text)
-    text = text.replace("\r", " ").replace("\n", " ")
+    if replacements:
+        for old, new in replacements.items():
+            text = text.replace(old, new)
+    text = text.replace("\r", "").replace("\n", "")
+    return "".join(text.split())
 
-    return " ".join(text.split())
-
-
-def solve_detected_text(text: str) -> str:
-    math_answer = solve_math_expression(text)
-    return math_answer if math_answer is not None else text
-
-
-def solve_math_expression(text: str) -> str | None:
-    normalized = (
-        text.replace("−", "-")
-        .replace("–", "-")
-        .replace("—", "-")
-        .replace("×", "*")
-        .replace("x", "*")
-        .replace("X", "*")
-        .replace("÷", "/")
-    )
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-
-    match = re.search(
-        r"(?<![\w.])(-?\d+)\s*([+\-*/])\s*(-?\d+)(?![\w.])",
-        normalized,
-    )
-    if not match:
-        return None
-
-    left = int(match.group(1))
-    operator = match.group(2)
-    right = int(match.group(3))
-
-    if operator == "+":
-        return str(left + right)
-    if operator == "-":
-        return str(left - right)
-    if operator == "*":
-        return str(left * right)
-    if operator == "/" and right != 0:
-        quotient = left / right
-        return str(int(quotient)) if quotient.is_integer() else str(quotient)
-
-    return None
 
 
 def duplicate_key(text: str) -> str:
@@ -288,9 +283,26 @@ class EasyOcrReader:
 
         try:
             import numpy as np
+            from PIL import Image, ImageEnhance
+
+            # 1. Grayscale
+            gray = image.convert("L")
+            # 2. Resize 2.5x using LANCZOS or BICUBIC to improve resolution
+            w, h = gray.size
+            try:
+                resample_filter = Image.Resampling.LANCZOS
+            except AttributeError:
+                try:
+                    resample_filter = Image.ANTIALIAS
+                except AttributeError:
+                    resample_filter = Image.BICUBIC
+            resized = gray.resize((int(w * 2.5), int(h * 2.5)), resample_filter)
+            # 3. Double the contrast to make text bolder and background cleaner
+            enhancer = ImageEnhance.Contrast(resized)
+            enhanced = enhancer.enhance(2.0)
 
             results = reader.readtext(
-                np.array(image.convert("RGB")),
+                np.array(enhanced.convert("RGB")),
                 detail=1,
                 paragraph=False,
             )
@@ -375,12 +387,14 @@ class NvidiaVisionClient:
                         {
                             "type": "text",
                             "text": (
-                                "Read the exact visible challenge text in this "
-                                "screenshot. Preserve uppercase letters, lowercase "
-                                "letters, digits, spaces, and symbols exactly as "
-                                "shown. If it is an arithmetic expression, return "
-                                "the expression exactly as shown, not the answer. "
-                                "Return only the visible text. No explanation."
+                                "Transcribe the exact alphanumeric characters shown in the image. "
+                                "Do NOT perform any calculations or solve any math problems. "
+                                "For example, if the image shows '3+5', you must output '3+5' and NOT '8'. "
+                                "Return ONLY the literal text from the image. "
+                                "No explanations, no preamble, no markdown, no labels. "
+                                "If the image does not contain any clear alphanumeric characters or CAPTCHA "
+                                "(for example, if it is blank, contains only noise, a loading spinner, "
+                                "a cursor, or UI element borders), you MUST output 'NONE'."
                             ),
                         },
                         {
@@ -395,26 +409,34 @@ class NvidiaVisionClient:
             "stream": False,
         }
 
-        try:
-            response = requests.post(
-                self.config.nvidia_api_url,
-                headers={
-                    "Authorization": self._auth_header(),
-                    "Accept": "application/json",
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-                timeout=(
-                    self.config.ai_connect_timeout_seconds,
-                    self.config.ai_timeout_seconds,
-                ),
-            )
-            response.raise_for_status()
-            data = response.json()
-            return clean_model_output(extract_message_content(data))
-        except Exception as exc:
-            print(f"NVIDIA fallback failed: {exc}")
-            return ""
+        for attempt in range(1, 4):
+            try:
+                response = requests.post(
+                    self.config.nvidia_api_url,
+                    headers={
+                        "Authorization": self._auth_header(),
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=(
+                        self.config.ai_connect_timeout_seconds,
+                        self.config.ai_timeout_seconds,
+                    ),
+                )
+                response.raise_for_status()
+                data = response.json()
+                return clean_model_output(extract_message_content(data))
+            except Exception as exc:
+                print(f"[NVIDIA] Attempt {attempt} failed: {exc}")
+                if attempt < 3:
+                    if stop_event is not None and stop_event.wait(1.0):
+                        return ""
+                    elif stop_event is None:
+                        time.sleep(1.0)
+                else:
+                    print("NVIDIA fallback failed after 3 attempts")
+                    return ""
 
     def _auth_header(self) -> str:
         if self.config.nvidia_api_key.lower().startswith("bearer "):
@@ -448,6 +470,16 @@ class ScreenOcrBot:
             "SUBMIT_BUTTON",
             2,
             DEFAULT_SUBMIT_BUTTON,
+        )
+        self.play_button = parse_int_tuple(
+            "PLAY_BUTTON",
+            2,
+            DEFAULT_PLAY_BUTTON,
+        )
+        self.status_point = parse_int_tuple(
+            "STATUS_POINT",
+            2,
+            DEFAULT_STATUS_POINT,
         )
         self.easyocr = EasyOcrReader(config)
         self.nvidia = NvidiaVisionClient(config)
@@ -490,16 +522,32 @@ class ScreenOcrBot:
             self.submit_button = (position.x, position.y)
         print(f"Submit button set to {position.x},{position.y}")
 
+    def calibrate_play_button(self) -> None:
+        position = pyautogui.position()
+        with self._position_lock:
+            self.play_button = (position.x, position.y)
+        print(f"Play button set to {position.x},{position.y}")
+
+    def calibrate_status_point(self) -> None:
+        position = pyautogui.position()
+        with self._position_lock:
+            self.status_point = (position.x, position.y)
+        print(f"Status point set to {position.x},{position.y}")
+
     def print_positions(self) -> None:
         position = pyautogui.position()
         with self._position_lock:
             input_box = self.input_box
             submit_button = self.submit_button
+            play_button = self.play_button
+            status_point = self.status_point
 
         print(f"Mouse position: {position.x},{position.y}")
         print(f"CAPTURE_REGION={format_tuple(self.config.capture_region)}")
         print(f"INPUT_BOX={format_tuple(input_box)}")
         print(f"SUBMIT_BUTTON={format_tuple(submit_button)}")
+        print(f"PLAY_BUTTON={format_tuple(play_button)}")
+        print(f"STATUS_POINT={format_tuple(status_point)}")
 
         try:
             image = capture_screen(self.config)
@@ -512,67 +560,81 @@ class ScreenOcrBot:
     def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                self._watch_once()
+                self._step()
             except Exception as exc:
                 print(f"Bot loop error: {exc}")
 
             self._stop_event.wait(self.config.loop_delay_seconds)
 
-    def _watch_once(self) -> None:
+    def _step(self) -> None:
         image = capture_screen(self.config)
-        current_hash = frame_hash(image)
-        now = time.monotonic()
-
-        if self._last_frame_hash is None:
-            self._last_frame_hash = current_hash
-            if self.config.process_initial_frame:
-                self._handle_changed_image(image)
-            return
-
-        if current_hash == self._last_frame_hash:
-            return
-
-        self._last_frame_hash = current_hash
-        if now - self._last_change_at < self.config.change_cooldown_seconds:
-            return
-
-        self._last_change_at = now
-        if self.config.post_change_settle_seconds > 0:
-            if self._stop_event.wait(self.config.post_change_settle_seconds):
-                return
-            image = capture_screen(self.config)
-            self._last_frame_hash = frame_hash(image)
-
-        self._handle_changed_image(image)
-
-    def _handle_changed_image(self, image: Any) -> None:
         detected_text = self._read_text(image)
-        cleaned_text = clean_detected_text(detected_text)
+        cleaned_text = clean_detected_text(detected_text, self.config.character_replacements)
 
         if not cleaned_text:
-            print("No text detected")
             return
 
-        answer = (
-            solve_detected_text(cleaned_text)
-            if self.config.solve_math_challenges
-            else cleaned_text
-        )
+        if len(cleaned_text) < self.config.min_captcha_length:
+            print(f"[OCR] Ignored text too short: {cleaned_text!r} (length: {len(cleaned_text)} < min: {self.config.min_captcha_length})")
+            return
 
-        if self._is_recent_duplicate(answer):
-            print(f"Duplicate skipped: {answer}")
+        if len(cleaned_text) > self.config.max_captcha_length:
+            print(f"[OCR] Ignored text too long: {cleaned_text!r} (length: {len(cleaned_text)} > max: {self.config.max_captcha_length})")
+            return
+
+        if self._is_recent_duplicate(cleaned_text):
             return
 
         self._wait_for_submit_cooldown()
         if self._stop_event.is_set():
             return
 
-        self._paste_and_submit(answer)
-        self._mark_submitted(answer)
-        if answer == cleaned_text:
-            print(f"Submitted: {answer}")
+        self._paste_and_submit(cleaned_text)
+        self._mark_submitted(cleaned_text)
+        print(f"Submitted CAPTCHA: {cleaned_text}")
+
+        check_start = time.monotonic()
+        self._check_submission_status()
+        check_duration = time.monotonic() - check_start
+
+        # Wait a few seconds until new CAPTCHA comes and repeat
+        remaining_cooldown = max(0.1, self.config.change_cooldown_seconds - check_duration)
+        print(f"Waiting {remaining_cooldown:.1f} seconds for new CAPTCHA...")
+        self._stop_event.wait(remaining_cooldown)
+
+    def _check_submission_status(self) -> None:
+        with self._position_lock:
+            status_point = self.status_point
+
+        if not status_point or status_point == (0, 0):
+            return
+
+        # Poll for up to 3.5 seconds
+        start_time = time.monotonic()
+        detected_status = None
+        while time.monotonic() - start_time < 3.5:
+            if self._stop_event.is_set():
+                break
+            try:
+                # Get the pixel color at status_point
+                r, g, b = pyautogui.pixel(*status_point)
+                # Red-ish: r > 120 and r > g + 40 and r > b + 40
+                if r > 120 and r > g + 40 and r > b + 40:
+                    detected_status = "Wrong"
+                    break
+                # Green-ish: g > 120 and g > r + 40 and g > b + 20
+                elif g > 120 and g > r + 40 and g > b + 20:
+                    detected_status = "Correct"
+                    break
+            except Exception:
+                # Sometimes pyautogui.pixel fails if coordinates are out of bounds
+                pass
+            time.sleep(0.1)
+
+        if detected_status:
+            print(f"Submission Result: {detected_status}")
         else:
-            print(f"Submitted: {answer} (from {cleaned_text})")
+            print("Submission Result: Unknown (No status banner detected)")
 
     def _read_text(self, image: Any) -> str:
         if self.config.ocr_mode == "nvidia":
@@ -613,6 +675,7 @@ class ScreenOcrBot:
         with self._position_lock:
             input_box = self.input_box
             submit_button = self.submit_button
+            play_button = self.play_button
 
         pyperclip.copy(text)
         pyautogui.click(*input_box)
@@ -628,6 +691,12 @@ class ScreenOcrBot:
 
         pyautogui.click(*submit_button)
 
+        if play_button and play_button != (0, 0):
+            if self.config.play_delay_seconds > 0:
+                time.sleep(self.config.play_delay_seconds)
+            pyautogui.click(*play_button)
+            print(f"Clicked Play button at {play_button[0]},{play_button[1]}")
+
     def _mark_submitted(self, text: str) -> None:
         now = time.monotonic()
         self._last_submitted_at = now
@@ -637,6 +706,8 @@ class ScreenOcrBot:
 def print_hotkeys(config: Config) -> None:
     print("F6 = Set input box to current mouse position")
     print("F7 = Set submit button to current mouse position")
+    print("F10 = Set Play button to current mouse position")
+    print("F11 = Set status banner point to current mouse position")
     print("F8 = Start bot")
     print("F9 = Stop bot")
     print("F12 = Print current mouse/config positions")
@@ -668,6 +739,8 @@ def main() -> None:
     bot = ScreenOcrBot(config)
     keyboard.add_hotkey("F6", bot.calibrate_input_box)
     keyboard.add_hotkey("F7", bot.calibrate_submit_button)
+    keyboard.add_hotkey("F10", bot.calibrate_play_button)
+    keyboard.add_hotkey("F11", bot.calibrate_status_point)
     keyboard.add_hotkey("F8", bot.start)
     keyboard.add_hotkey("F9", bot.stop)
     keyboard.add_hotkey("F12", bot.print_positions)
