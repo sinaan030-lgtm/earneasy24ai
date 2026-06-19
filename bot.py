@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
-import json
 import os
 import re
 import threading
@@ -24,15 +23,6 @@ DEFAULT_SUBMIT_BUTTON = (200, 400)
 
 DEFAULT_NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 DEFAULT_NVIDIA_MODEL = "meta/llama-3.2-11b-vision-instruct"
-
-# Existing cleanup map kept as the default behavior.
-DEFAULT_CHARACTER_REPLACEMENTS = {
-    ":": "=",
-    "5": "s",
-    "9": "g",
-    "O": "@",
-    "?": "@",
-}
 
 OCR_MODE_ALIASES = {
     "ai": "nvidia",
@@ -66,9 +56,9 @@ class Config:
     paste_delay_seconds: float
     submit_delay_seconds: float
     clear_input_before_paste: bool
+    solve_math_challenges: bool
     pyautogui_pause: float
     pyautogui_failsafe: bool
-    character_replacements: dict[str, str]
 
 
 def load_dotenv() -> None:
@@ -155,33 +145,11 @@ def parse_languages(value: str) -> tuple[str, ...]:
 
 def parse_ocr_mode(value: str) -> str:
     mode = OCR_MODE_ALIASES.get(value.strip().lower(), value.strip().lower())
-    if mode in {"easyocr", "hybrid", "nvidia"}:
+    if mode in {"accurate", "easyocr", "hybrid", "nvidia"}:
         return mode
 
     print(f"Invalid OCR_MODE={value!r}; using hybrid")
     return "hybrid"
-
-
-def parse_character_replacements() -> dict[str, str]:
-    replacements = dict(DEFAULT_CHARACTER_REPLACEMENTS)
-    raw_json = env_str("CHARACTER_REPLACEMENTS_JSON")
-    if not raw_json:
-        return replacements
-
-    try:
-        parsed = json.loads(raw_json)
-    except json.JSONDecodeError as exc:
-        print(f"Invalid CHARACTER_REPLACEMENTS_JSON; using defaults: {exc}")
-        return replacements
-
-    if not isinstance(parsed, dict):
-        print("Invalid CHARACTER_REPLACEMENTS_JSON; expected a JSON object")
-        return replacements
-
-    for old, new in parsed.items():
-        replacements[str(old)] = str(new)
-
-    return replacements
 
 
 def read_config() -> Config:
@@ -216,9 +184,9 @@ def read_config() -> Config:
         paste_delay_seconds=env_float("PASTE_DELAY_SECONDS", 0.05),
         submit_delay_seconds=env_float("SUBMIT_DELAY_SECONDS", 0.05),
         clear_input_before_paste=env_bool("CLEAR_INPUT_BEFORE_PASTE", True),
+        solve_math_challenges=env_bool("SOLVE_MATH_CHALLENGES", True),
         pyautogui_pause=env_float("PYAUTOGUI_PAUSE", 0.02),
         pyautogui_failsafe=env_bool("PYAUTOGUI_FAILSAFE", True),
-        character_replacements=parse_character_replacements(),
     )
 
 
@@ -255,12 +223,52 @@ def clean_model_output(text: str) -> str:
     return text
 
 
-def clean_detected_text(text: str, replacements: dict[str, str]) -> str:
+def clean_detected_text(text: str) -> str:
     text = clean_model_output(text)
-    for old, new in replacements.items():
-        text = text.replace(old, new)
+    text = text.replace("\r", " ").replace("\n", " ")
 
     return " ".join(text.split())
+
+
+def solve_detected_text(text: str) -> str:
+    math_answer = solve_math_expression(text)
+    return math_answer if math_answer is not None else text
+
+
+def solve_math_expression(text: str) -> str | None:
+    normalized = (
+        text.replace("−", "-")
+        .replace("–", "-")
+        .replace("—", "-")
+        .replace("×", "*")
+        .replace("x", "*")
+        .replace("X", "*")
+        .replace("÷", "/")
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+
+    match = re.search(
+        r"(?<![\w.])(-?\d+)\s*([+\-*/])\s*(-?\d+)(?![\w.])",
+        normalized,
+    )
+    if not match:
+        return None
+
+    left = int(match.group(1))
+    operator = match.group(2)
+    right = int(match.group(3))
+
+    if operator == "+":
+        return str(left + right)
+    if operator == "-":
+        return str(left - right)
+    if operator == "*":
+        return str(left * right)
+    if operator == "/" and right != 0:
+        quotient = left / right
+        return str(int(quotient)) if quotient.is_integer() else str(quotient)
+
+    return None
 
 
 def duplicate_key(text: str) -> str:
@@ -291,14 +299,20 @@ class EasyOcrReader:
             return ""
 
         parts: list[str] = []
+        if not results:
+            print("[EasyOCR] No text structures found at all in the image.")
         for result in results:
             if len(result) < 3:
                 continue
 
             detected_text = str(result[1]).strip()
             confidence = float(result[2])
-            if detected_text and confidence >= self.config.easyocr_min_confidence:
-                parts.append(detected_text)
+            if detected_text:
+                if confidence >= self.config.easyocr_min_confidence:
+                    parts.append(detected_text)
+                    print(f"[EasyOCR] Detected text: {detected_text!r} (confidence: {confidence:.2f})")
+                else:
+                    print(f"[EasyOCR] Ignored low-confidence text: {detected_text!r} (confidence: {confidence:.2f} < threshold: {self.config.easyocr_min_confidence})")
 
         return " ".join(parts).strip()
 
@@ -361,9 +375,12 @@ class NvidiaVisionClient:
                         {
                             "type": "text",
                             "text": (
-                                "Read the exact visible text in this screenshot. "
-                                "Return only the text. If there is no readable text, "
-                                "return an empty string."
+                                "Read the exact visible challenge text in this "
+                                "screenshot. Preserve uppercase letters, lowercase "
+                                "letters, digits, spaces, and symbols exactly as "
+                                "shown. If it is an arithmetic expression, return "
+                                "the expression exactly as shown, not the answer. "
+                                "Return only the visible text. No explanation."
                             ),
                         },
                         {
@@ -484,6 +501,14 @@ class ScreenOcrBot:
         print(f"INPUT_BOX={format_tuple(input_box)}")
         print(f"SUBMIT_BUTTON={format_tuple(submit_button)}")
 
+        try:
+            image = capture_screen(self.config)
+            debug_path = Path("debug_capture.png")
+            image.save(debug_path)
+            print(f"[Debug] Saved screenshot of CAPTCHA region to: {debug_path.resolve()}")
+        except Exception as e:
+            print(f"[Debug] Failed to save screenshot: {e}")
+
     def _run(self) -> None:
         while not self._stop_event.is_set():
             try:
@@ -522,32 +547,42 @@ class ScreenOcrBot:
 
     def _handle_changed_image(self, image: Any) -> None:
         detected_text = self._read_text(image)
-        cleaned_text = clean_detected_text(
-            detected_text,
-            self.config.character_replacements,
-        )
+        cleaned_text = clean_detected_text(detected_text)
 
         if not cleaned_text:
             print("No text detected")
             return
 
-        if self._is_recent_duplicate(cleaned_text):
-            print(f"Duplicate skipped: {cleaned_text}")
+        answer = (
+            solve_detected_text(cleaned_text)
+            if self.config.solve_math_challenges
+            else cleaned_text
+        )
+
+        if self._is_recent_duplicate(answer):
+            print(f"Duplicate skipped: {answer}")
             return
 
         self._wait_for_submit_cooldown()
         if self._stop_event.is_set():
             return
 
-        self._paste_and_submit(cleaned_text)
-        self._mark_submitted(cleaned_text)
-        print(f"Submitted: {cleaned_text}")
+        self._paste_and_submit(answer)
+        self._mark_submitted(answer)
+        if answer == cleaned_text:
+            print(f"Submitted: {answer}")
+        else:
+            print(f"Submitted: {answer} (from {cleaned_text})")
 
     def _read_text(self, image: Any) -> str:
         if self.config.ocr_mode == "nvidia":
             return self.nvidia.read_text(image, self._stop_event)
 
         easyocr_text = self.easyocr.read_text(image)
+        if self.config.ocr_mode == "accurate":
+            nvidia_text = self.nvidia.read_text(image, self._stop_event)
+            return nvidia_text or easyocr_text
+
         if easyocr_text or self.config.ocr_mode == "easyocr":
             return easyocr_text
 
@@ -609,7 +644,21 @@ def print_hotkeys(config: Config) -> None:
     print(f"CAPTURE_REGION={format_tuple(config.capture_region)}")
 
 
+def make_dpi_aware() -> None:
+    import sys
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+
 def main() -> None:
+    make_dpi_aware()
     load_dotenv()
     config = read_config()
 

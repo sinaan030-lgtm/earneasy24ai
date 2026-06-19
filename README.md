@@ -20,17 +20,30 @@ CAPTURE_REGION=700,193,478,205
 INPUT_BOX=100,325
 SUBMIT_BUTTON=200,400
 
-OCR_MODE=hybrid
+OCR_MODE=accurate
 NVIDIA_API_KEY=
 
 DUPLICATE_TEXT_WINDOW_SECONDS=10.0
+SOLVE_MATH_CHALLENGES=true
 ```
 
 OCR modes:
 
+- `accurate`: EasyOCR first, then NVIDIA verification when an API key is set.
 - `hybrid`: EasyOCR first, NVIDIA fallback only when EasyOCR returns nothing.
 - `easyocr`: EasyOCR only.
 - `nvidia`: NVIDIA vision API for every processed screenshot.
+
+## Calibrate
+
+Run this first whenever the window moves or your screen resolution changes:
+
+```powershell
+python calibrate.py
+```
+
+It captures the CAPTCHA box, input field, and Submit button coordinates, then
+prints the exact `.env` lines to use.
 
 ## Run
 
