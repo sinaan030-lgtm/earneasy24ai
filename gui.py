@@ -169,9 +169,14 @@ class BotApp:
         # Initialize Bot Backend
         self.bot = ScreenOcrBot(self.config)
 
-        # Set up stdout redirection queue
+        self.correct_count = 0
+        self.wrong_count = 0
+
+        # Set up stdout/stderr redirection queue so ALL output (including
+        # tracebacks) appears in the GUI log instead of vanishing silently.
         self.log_queue = queue.Queue()
         sys.stdout = QueueWriter(self.log_queue)
+        sys.stderr = QueueWriter(self.log_queue)
 
         # Hotkeys bindings
         self.setup_keyboard_hotkeys()
@@ -371,6 +376,52 @@ class BotApp:
             toolbar, "📋\nCopy", self.copy_logs
         )
 
+        # Stats Display Group (Packed to the right of the toolbar)
+        stats_frame = tk.Frame(toolbar, bg=self.bg_color)
+        stats_frame.pack(side=tk.RIGHT, padx=15, pady=5)
+
+        # Correct Card
+        card_correct = tk.Frame(stats_frame, bg="#2d2d2d", padx=8, pady=4)
+        card_correct.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(
+            card_correct,
+            text="CORRECT",
+            font=("Segoe UI", 8, "bold"),
+            bg="#2d2d2d",
+            fg="#aaaaaa",
+        ).pack(anchor="center")
+
+        self.lbl_correct_val = tk.Label(
+            card_correct,
+            text="0",
+            font=("Segoe UI", 14, "bold"),
+            bg="#2d2d2d",
+            fg=self.accent_green,
+        )
+        self.lbl_correct_val.pack(anchor="center")
+
+        # Wrong Card
+        card_wrong = tk.Frame(stats_frame, bg="#2d2d2d", padx=8, pady=4)
+        card_wrong.pack(side=tk.LEFT, padx=5)
+
+        tk.Label(
+            card_wrong,
+            text="WRONG",
+            font=("Segoe UI", 8, "bold"),
+            bg="#2d2d2d",
+            fg="#aaaaaa",
+        ).pack(anchor="center")
+
+        self.lbl_wrong_val = tk.Label(
+            card_wrong,
+            text="0",
+            font=("Segoe UI", 14, "bold"),
+            bg="#2d2d2d",
+            fg=self.accent_red,
+        )
+        self.lbl_wrong_val.pack(anchor="center")
+
         # Central Table (Action List)
         table_frame = tk.Frame(main_panel, bg=self.bg_color)
         table_frame.pack(fill=tk.BOTH, expand=True, pady=5)
@@ -569,28 +620,16 @@ class BotApp:
         keyboard.add_hotkey("F12", self.hotkey_print_positions)
 
     def hotkey_calibrate_input(self):
-        self.bot.calibrate_input_box()
-        self.update_coordinates_display()
-        self.add_log_row(
-            "Calibrate Input",
-            f"Hotkey F6: Set to {self.bot.input_box[0]},{self.bot.input_box[1]}",
-        )
+        pos = pyautogui.position()
+        self.save_click_calibration("Input", (pos.x, pos.y))
 
     def hotkey_calibrate_submit(self):
-        self.bot.calibrate_submit_button()
-        self.update_coordinates_display()
-        self.add_log_row(
-            "Calibrate Submit",
-            f"Hotkey F7: Set to {self.bot.submit_button[0]},{self.bot.submit_button[1]}",
-        )
+        pos = pyautogui.position()
+        self.save_click_calibration("Submit", (pos.x, pos.y))
 
     def hotkey_calibrate_status(self):
-        self.bot.calibrate_status_point()
-        self.update_coordinates_display()
-        self.add_log_row(
-            "Calibrate Status",
-            f"Hotkey F11: Set to {self.bot.status_point[0]},{self.bot.status_point[1]}",
-        )
+        pos = pyautogui.position()
+        self.save_click_calibration("Status", (pos.x, pos.y))
 
     def hotkey_start_bot(self):
         self.root.after(0, self.start_bot)
@@ -604,12 +643,10 @@ class BotApp:
             "System Debug", "F12 triggered: printed config positions to CLI"
         )
 
-    # Execution controls
     def start_bot(self):
         # Reload config and refresh all bot internals
         new_config = read_config()
-        self.bot.config = new_config
-        self.bot.nvidia.config = new_config
+        self.bot.update_config(new_config)
 
         # Update status labels
         self.lbl_status.config(text="STATUS: RUNNING...", fg=self.accent_green)
@@ -636,7 +673,7 @@ class BotApp:
                 "CAPTURE_REGION": f"{region[0]},{region[1]},{region[2]},{region[3]}"
             }
         )
-        self.bot.config = read_config()
+        self.bot.update_config(read_config())
         self.update_coordinates_display()
         self.add_log_row(
             "Calibrate Region", f"Set CAPTCHA region to: {region}"
@@ -665,12 +702,13 @@ class BotApp:
 
         # Sync in-memory coordinates
         if "Input" in target:
-            self.bot.input_box = pos
+            self.bot.set_input_box(pos)
         elif "Submit" in target:
-            self.bot.submit_button = pos
+            self.bot.set_submit_button(pos)
         elif "Status" in target:
-            self.bot.status_point = pos
+            self.bot.set_status_point(pos)
 
+        self.bot.update_config(read_config())
         self.update_coordinates_display()
         self.add_log_row(f"Calibrate {target}", f"Set to {pos[0]},{pos[1]}")
 
@@ -685,7 +723,15 @@ class BotApp:
                 new_values[key] = entry.get()
 
         self.save_env_values(new_values)
-        self.bot.config = read_config()
+        
+        new_config = read_config()
+        self.bot.update_config(new_config)
+        self.config = new_config
+
+        import pyautogui as _pag
+        _pag.PAUSE = new_config.pyautogui_pause
+        _pag.FAILSAFE = new_config.pyautogui_failsafe
+
         messagebox.showinfo("Settings", "Settings saved successfully!")
         self.add_log_row("System Settings", "Updated configurations successfully.")
 
@@ -720,6 +766,13 @@ class BotApp:
     def clear_logs(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
+        self.correct_count = 0
+        self.wrong_count = 0
+        self.update_stats_display()
+
+    def update_stats_display(self):
+        self.lbl_correct_val.config(text=str(self.correct_count))
+        self.lbl_wrong_val.config(text=str(self.wrong_count))
 
     def copy_logs(self):
         log_lines = []
@@ -775,11 +828,14 @@ class BotApp:
             return "Submission Result", val
         elif "Status point set to" in msg:
             return "Calibrate Status", msg.split("set to")[-1].strip()
-        elif "[Confirm] Mismatch" in msg:
-            val = msg.split("[Confirm] Mismatch")[-1].strip().lstrip(" —-")
+        elif "[Confirm] Mismatch" in msg or "[Confirm] Parallel Mismatch" in msg:
+            # e.g. "[Confirm] Parallel Mismatch ('a' vs 'b' vs 'c'). Best guess: 'a'"
+            val = msg.split("[Confirm]")[-1].strip().lstrip(" —-")
             return "Confirm Mismatch", val
-        elif "[Confirm] Agreed" in msg:
-            val = msg.split("[Confirm] Agreed:")[-1].strip().strip("'")
+        elif "[Confirm] Parallel Agree" in msg or "[Confirm] Agreed" in msg:
+            # e.g. "[Confirm] Parallel Agree (Run 1 & 2): 'ABCD'"
+            # extract the captcha value after the colon
+            val = msg.split(":")[-1].strip().strip("'")
             return "Confirm OK", val
         elif "[Confirm]" in msg:
             return "Confirm", msg.split("[Confirm]")[-1].strip()
@@ -796,8 +852,12 @@ class BotApp:
                 if action == "Submission Result":
                     if "Correct" in value:
                         tag = "correct"
+                        self.correct_count += 1
+                        self.update_stats_display()
                     elif "Wrong" in value:
                         tag = "wrong"
+                        self.wrong_count += 1
+                        self.update_stats_display()
                 elif action == "Confirm Mismatch":
                     tag = "mismatch"
                 elif action == "Confirm OK":

@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -55,7 +56,7 @@ class Config:
     double_check: bool
 
 
-def load_dotenv() -> None:
+def load_dotenv(force: bool = False) -> None:
     env_path = Path(__file__).with_name(".env")
     if not env_path.exists():
         return
@@ -69,8 +70,9 @@ def load_dotenv() -> None:
         key = key.strip()
         value = value.strip().strip('"').strip("'")
 
-        if key and key not in os.environ:
-            os.environ[key] = value
+        if key:
+            if force or key not in os.environ:
+                os.environ[key] = value
 
 
 def env_str(name: str, default: str = "") -> str:
@@ -134,6 +136,7 @@ def parse_int_tuple(
 
 
 def read_config() -> Config:
+    load_dotenv(force=True)
     replacements_str = env_str("CHARACTER_REPLACEMENTS_JSON", "")
     replacements = {}
     if replacements_str:
@@ -183,6 +186,32 @@ def format_tuple(values: tuple[int, ...]) -> str:
     return ",".join(str(value) for value in values)
 
 
+def save_to_env(updates: dict[str, str]) -> None:
+    """Write or update key=value pairs in the .env file without restarting."""
+    env_path = Path(__file__).with_name(".env")
+    lines: list[str] = []
+    if env_path.exists():
+        lines = env_path.read_text(encoding="utf-8").splitlines(keepends=True)
+
+    existing_keys: dict[str, int] = {}
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key, _ = stripped.split("=", 1)
+            existing_keys[key.strip()] = idx
+
+    for key, val in updates.items():
+        if key in existing_keys:
+            lines[existing_keys[key]] = f"{key}={val}\n"
+        else:
+            lines.append(f"{key}={val}\n")
+
+    env_path.write_text("".join(lines), encoding="utf-8")
+    # Reflect changes immediately in os.environ so read_config() picks them up
+    for key, val in updates.items():
+        os.environ[key] = val
+
+
 def capture_screen(config: Config):
     return pyautogui.screenshot(region=config.capture_region)
 
@@ -201,39 +230,48 @@ def image_to_png_data_url(image: Any) -> str:
 
 def clean_model_output(text: str) -> str:
     text = text.strip()
-    
-    # Support Chain-of-Thought output: search for "CAPTCHA: <value>" (case-insensitive)
-    match = re.search(r"CAPTCHA\s*:\s*([^\s\n]+)", text, re.IGNORECASE)
-    if match:
-        text = match.group(1).strip()
 
-    # Remove markdown formatting characters (bold, italics, headers, etc.)
-    text = text.replace("**", "").replace("__", "").replace("*", "").replace("_", "")
-    
-    # Strip common code blocks
-    text = re.sub(r"^```(?:text)?", "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r"```$", "", text).strip()
-    
-    # Strip common prefixes like "Answer:", "Captcha:", "Text:", "Result:", "Value:", etc.
-    # including "The answer is:", "The captcha is:"
-    prefix_pattern = r"^(?:the\s+)?(?:captcha|answer|text|value|solution|challenge|result)(?:\s+is)?\s*[:=-]\s*"
-    text = re.sub(prefix_pattern, "", text, flags=re.IGNORECASE).strip()
-    
-    # Strip quotes, backticks, and extra spaces again
-    text = text.strip("\"'` ")
+    # Support Chain-of-Thought output: search for "CAPTCHA: <value>" (case-insensitive)
+    match = re.search(r"CAPTCHA\s*:\s*([^\r\n]+)", text, re.IGNORECASE)
+    if match:
+        # Successfully extracted via CAPTCHA: prefix — preserve the value as-is
+        # (do NOT strip underscores or other chars that are valid CAPTCHA characters)
+        text = match.group(1).strip().strip("\"'` ")
+    else:
+        # No structured prefix — treat as raw model output and remove markdown
+        # formatting artifacts (bold **text**, italic *text*, __underline__, etc.)
+        text = text.replace("**", "").replace("__", "").replace("*", "")
+
+        # Strip common code blocks
+        text = re.sub(r"^```(?:text)?", "", text, flags=re.IGNORECASE).strip()
+        text = re.sub(r"```$", "", text).strip()
+
+        # Strip common answer prefixes: "Answer:", "Text:", "The captcha is:", etc.
+        prefix_pattern = r"^(?:the\s+)?(?:captcha|answer|text|value|solution|challenge|result)(?:\s+is)?\s*[:=-]\s*"
+        text = re.sub(prefix_pattern, "", text, flags=re.IGNORECASE).strip()
+
+        # Strip surrounding quotes/backticks
+        text = text.strip("\"'` ")
 
     lower_text = text.lower()
-    if any(phrase in lower_text for phrase in ["sorry", "cannot read", "unable to", "don't see", "no text", "clear text", "i see", "loading spinner", "blinking cursor"]):
+    if any(phrase in lower_text for phrase in [
+        "sorry", "cannot read", "unable to", "don't see",
+        "no text", "clear text", "i see", "loading spinner", "blinking cursor",
+    ]):
         return ""
 
     # Reject literal template placeholders the AI might echo from the prompt
-    if text in {"<answer>", "VALUE", "value", "[answer]", "[value]"}:
+    if text in {"<answer>", "<exact_characters>", "<exact_text>", "<value>",
+                "<text>", "VALUE", "value", "[answer]", "[value]"}:
         return ""
 
     # Strip trailing punctuation for the none-check (handles 'NONE.' / 'NONE!' etc.)
     stripped_lower = lower_text.rstrip(".,!?;:")
     if stripped_lower in {"none", "no text", "no visible text", "n/a", ""}:
         return ""
+
+    # Strip trailing punctuation commonly added by LLMs
+    text = text.rstrip(".,!?;:")
 
     return text
 
@@ -250,56 +288,47 @@ def clean_detected_text(text: str, replacements: dict[str, str] = None) -> str:
     return text
 
 
-def solve_math_captcha(text: str) -> str:
-    """If *text* is a pure arithmetic expression, evaluate and return the result.
-
-    Handles expressions like: 6-8, +53-208, 3+5*2, 10/2
-    Returns the original text unchanged if it does not look like math.
-    """
-    # Only attempt eval when the entire text is an arithmetic expression
-    # Allow digits, +, -, *, /, spaces, parentheses — nothing else
-    if not re.match(r"^[\d\s+\-*/().]+$", text):
-        return text
-    # Must contain at least one operator to be a math expression
-    if not re.search(r"[+\-*/]", text):
-        return text
-    try:
-        result = eval(  # noqa: S307  # safe: only arithmetic chars allowed
-            text,
-            {"__builtins__": {}},
-            {},
-        )
-        if isinstance(result, float) and result.is_integer():
-            result = int(result)
-        return str(result)
-    except Exception:
-        return text
-
-
 
 def duplicate_key(text: str) -> str:
     return " ".join(text.casefold().split())
 
 
-def _preprocess_for_ai(image: Any) -> Any:
-    """Upscale the CAPTCHA image so the AI model can read it clearly.
+def _preprocess_for_ai(image: Any, mode: int = 0) -> Any:
+    """Preprocess the CAPTCHA image before sending to the AI model.
 
-    The captured region is scaled up 2× with a high-quality filter to give the
-    vision model cleaner character shapes, without sharpening artifacts.
+    Three distinct pipelines give meaningfully different views of the same
+    CAPTCHA, improving consensus quality when 3 reads are compared:
+
+        mode=0 (default): 2× LANCZOS upscale — baseline high-quality view.
+        mode=1: 2× upscale + gentle contrast boost (1.4×) — makes chars bolder
+                without clipping or distorting shapes.
+        mode=2: 2× upscale + slight brightness reduction (0.85×) — makes dark
+                characters on a light background stand out more.
     """
     try:
-        from PIL import Image
+        from PIL import Image, ImageEnhance
 
-        # Convert to RGB so all downstream operations are consistent
+        # Always start from RGB so operations are consistent
         img = image.convert("RGB")
-
-        # Upscale 2× with LANCZOS (best quality for downsampled text)
         w, h = img.size
+
         try:
             resample = Image.Resampling.LANCZOS
         except AttributeError:
             resample = Image.ANTIALIAS  # type: ignore[attr-defined]
+
+        # Common first step: 2× LANCZOS upscale for all modes
         img = img.resize((w * 2, h * 2), resample)
+
+        if mode == 1:
+            # Gentle contrast boost — makes faint/thin strokes stand out without
+            # clipping pixel values or distorting character shapes
+            img = ImageEnhance.Contrast(img).enhance(1.4)
+        elif mode == 2:
+            # Slight brightness reduction — dark chars on light bg become more
+            # distinct; does not touch hue or saturation so colour info is kept
+            img = ImageEnhance.Brightness(img).enhance(0.85)
+        # else mode=0: plain 2× LANCZOS upscale (already done above)
 
         return img
     except Exception:
@@ -307,23 +336,87 @@ def _preprocess_for_ai(image: Any) -> Any:
         return image
 
 
+# Three distinct prompting strategies used in parallel reads.
+# Different angles on the same problem create genuine diversity even at temperature=0.
+_PROMPT_VARIANTS = (
+    # Variant 0: Detailed with full disambiguation hints
+    (
+        "You are a CAPTCHA transcription engine. Your ONLY job is to read the exact characters shown in this CAPTCHA image.\n"
+        "\n"
+        "OUTPUT FORMAT (mandatory): CAPTCHA: <exact_characters>\n"
+        "If the image is unreadable: CAPTCHA: NONE\n"
+        "\n"
+        "RULES:\n"
+        "1. Copy every visible character exactly as shown, left to right. This includes letters, digits, AND all special characters (%, =, @, #, $, !, +, -, etc.).\n"
+        "2. Ignore decorations only: strike-through lines, grid lines, and background noise are NOT part of the CAPTCHA answer.\n"
+        "3. Case-sensitive: uppercase A-Z and lowercase a-z are DIFFERENT — preserve exactly as shown.\n"
+        "4. Common look-alike pairs — choose the one that visually matches the pixel shape:\n"
+        "   - 0 (zero, round) vs O (letter O, slightly taller oval)\n"
+        "   - 1 (one, thin vertical) vs l (lowercase L) vs I (capital i)\n"
+        "   - 5 (five, angular top) vs S (letter S, curved)\n"
+        "   - 2 (two) vs Z (letter Z)\n"
+        "   - 9 (nine) vs g (letter g) vs q (letter q)\n"
+        "   - 8 (eight) vs B (letter B)\n"
+        "   - 6 (six) vs b (letter b)\n"
+        "   - rn (two letters r+n) vs m (one letter m)\n"
+        "   - cl (two letters c+l) vs d (one letter d)\n"
+        "5. Do NOT add explanations, steps, or any text beyond the CAPTCHA value itself.\n"
+        "6. Output ONLY the single line: CAPTCHA: <value>"
+    ),
+    # Variant 1: Minimal and direct (pure vision, no priming hints)
+    (
+        "Look at this CAPTCHA image and output exactly the text you see.\n"
+        "Format: CAPTCHA: <text>\n"
+        "Rules: preserve exact case, include every symbol visible, do not add explanations.\n"
+        "Output ONLY: CAPTCHA: <text>"
+    ),
+    # Variant 2: Case and special-character focused
+    (
+        "Transcribe this CAPTCHA image character by character, left to right.\n"
+        "Format: CAPTCHA: <exact_text>\n"
+        "Critical:\n"
+        "- Exact case required: lowercase a-z and uppercase A-Z are DIFFERENT characters\n"
+        "- Include every special symbol shown (%, =, @, #, $, !, +, etc.)\n"
+        "- Distinguish carefully: 0 vs O, 1 vs l vs I, 5 vs S, 2 vs Z, 8 vs B\n"
+        "- Ignore background lines/noise — output ONLY the actual CAPTCHA text\n"
+        "Output ONLY: CAPTCHA: <exact_text>"
+    ),
+)
+
+
 class NvidiaVisionClient:
     def __init__(self, config: Config) -> None:
         self.config = config
         self._last_call_at = 0.0
         self._missing_key_reported = False
+        self._consecutive_network_failures = 0
+        self._network_backoff_until = 0.0
+        self._last_failure_at = 0.0
+        self._last_backoff_warned_at = 0.0
+        self._lock = threading.Lock()
 
     def read_text(
         self,
         image: Any,
         stop_event: threading.Event | None = None,
         bypass_cooldown: bool = False,
+        prompt_variant: int = 0,
     ) -> str:
         if not self.config.nvidia_api_key:
             if not self._missing_key_reported:
                 print("NVIDIA fallback unavailable: NVIDIA_API_KEY is not set")
                 self._missing_key_reported = True
             return ""
+
+        # Check circuit breaker / backoff
+        now = time.monotonic()
+        with self._lock:
+            if now < self._network_backoff_until:
+                if now - self._last_backoff_warned_at > 15.0:
+                    remaining = self._network_backoff_until - now
+                    print(f"[NVIDIA] Circuit breaker active (network down?). Skipping API calls for next {remaining:.1f}s.")
+                    self._last_backoff_warned_at = now
+                return ""
 
         if not bypass_cooldown:
             now = time.monotonic()
@@ -336,6 +429,7 @@ class NvidiaVisionClient:
                     time.sleep(remaining)
 
         self._last_call_at = time.monotonic()
+        prompt_text = _PROMPT_VARIANTS[prompt_variant % len(_PROMPT_VARIANTS)]
         payload = {
             "model": self.config.nvidia_model,
             "messages": [
@@ -344,17 +438,7 @@ class NvidiaVisionClient:
                     "content": [
                         {
                             "type": "text",
-                            "text": (
-                                "Analyze this CAPTCHA image and output ONLY the answer in this exact format:\n"
-                                "CAPTCHA: VALUE\n"
-                                "\n"
-                                "Guidelines:\n"
-                                "1. Transcribe every character exactly from left to right, including '%', '/', etc.\n"
-                                "2. Ignore background noise (strike-through lines, grid lines).\n"
-                                "3. For math equations, compute and output ONLY the numeric result.\n"
-                                "4. Be careful with look-alike characters (0/O, 1/l/I, 9/g, S/5, Z/2).\n"
-                                "5. Do NOT write any steps, explanations, or thoughts. Output ONLY 'CAPTCHA: <value>' (or 'CAPTCHA: NONE' if unreadable)."
-                            ),
+                            "text": prompt_text,
                         },
                         {
                             "type": "image_url",
@@ -370,6 +454,7 @@ class NvidiaVisionClient:
             "stream": False,
         }
 
+        success = False
         for attempt in range(1, 4):
             try:
                 response = requests.post(
@@ -387,8 +472,18 @@ class NvidiaVisionClient:
                 )
                 response.raise_for_status()
                 data = response.json()
-                return clean_model_output(extract_message_content(data))
+                result = clean_model_output(extract_message_content(data))
+                success = True
+                
+                # Reset circuit breaker on successful API call
+                with self._lock:
+                    if self._consecutive_network_failures > 0:
+                        print("[NVIDIA] API connection recovered. Resetting circuit breaker.")
+                    self._consecutive_network_failures = 0
+                    self._network_backoff_until = 0.0
+                return result
             except Exception as exc:
+                # We only print individual attempt failures if the circuit breaker hasn't kicked in
                 print(f"[NVIDIA] Attempt {attempt} failed: {exc}")
                 if attempt < 3:
                     if stop_event is not None and stop_event.wait(1.0):
@@ -396,7 +491,29 @@ class NvidiaVisionClient:
                     elif stop_event is None:
                         time.sleep(1.0)
 
-        print("NVIDIA fallback failed after 3 attempts")
+        # If all 3 attempts failed, handle circuit breaker logic
+        if not success:
+            with self._lock:
+                now_fail = time.monotonic()
+                # Treat parallel failures within 1.5 seconds as a single failure event
+                if now_fail - self._last_failure_at > 1.5:
+                    self._consecutive_network_failures += 1
+                    self._last_failure_at = now_fail
+                    
+                    if self._consecutive_network_failures == 1:
+                        delay = 2.0
+                    elif self._consecutive_network_failures == 2:
+                        delay = 5.0
+                    elif self._consecutive_network_failures == 3:
+                        delay = 15.0
+                    elif self._consecutive_network_failures == 4:
+                        delay = 30.0
+                    else:
+                        delay = 60.0
+                    
+                    self._network_backoff_until = now_fail + delay
+                    print(f"[NVIDIA] Fallback failed. Consecutive network failure count: {self._consecutive_network_failures}. Backing off for {delay:.1f}s.")
+            
         return ""
 
     def _auth_header(self) -> str:
@@ -469,19 +586,39 @@ class ScreenOcrBot:
         position = pyautogui.position()
         with self._position_lock:
             self.input_box = (position.x, position.y)
+        save_to_env({"INPUT_BOX": f"{position.x},{position.y}"})
         print(f"Input box set to {position.x},{position.y}")
 
     def calibrate_submit_button(self) -> None:
         position = pyautogui.position()
         with self._position_lock:
             self.submit_button = (position.x, position.y)
+        save_to_env({"SUBMIT_BUTTON": f"{position.x},{position.y}"})
         print(f"Submit button set to {position.x},{position.y}")
 
     def calibrate_status_point(self) -> None:
         position = pyautogui.position()
         with self._position_lock:
             self.status_point = (position.x, position.y)
+        save_to_env({"STATUS_POINT": f"{position.x},{position.y}"})
         print(f"Status point set to {position.x},{position.y}")
+
+    def set_input_box(self, pos: tuple[int, int]) -> None:
+        with self._position_lock:
+            self.input_box = pos
+
+    def set_submit_button(self, pos: tuple[int, int]) -> None:
+        with self._position_lock:
+            self.submit_button = pos
+
+    def set_status_point(self, pos: tuple[int, int]) -> None:
+        with self._position_lock:
+            self.status_point = pos
+
+    def update_config(self, config: Config) -> None:
+        with self._state_lock:
+            self.config = config
+            self.nvidia.config = config
 
     def print_positions(self) -> None:
         position = pyautogui.position()
@@ -510,39 +647,47 @@ class ScreenOcrBot:
                 self._step()
             except Exception as exc:
                 print(f"Bot loop error: {exc}")
+                print(traceback.format_exc())
 
             self._stop_event.wait(self.config.loop_delay_seconds)
 
     def _step(self) -> None:
         image = capture_screen(self.config)
-        
+
         current_hash = frame_hash(image)
         if self._last_frame_hash and current_hash == self._last_frame_hash:
-            return
+            return  # Frame unchanged — nothing to do
+
+        # New frame detected. Wait briefly so that rapid loading/transition
+        # frames are skipped, then re-capture the most recent stable view.
+        # We always proceed after the wait — never loop-bail — to avoid an
+        # infinite defer when the CAPTCHA region has continuous animation.
+        settle = self.config.post_change_settle_seconds
+        if settle > 0 and not self._stop_event.wait(settle):
+            image = capture_screen(self.config)
+            current_hash = frame_hash(image)
+
         self._last_frame_hash = current_hash
 
         detected_text = self._read_and_confirm_text(image)
+        # _read_and_confirm_text already returns a cleaned string in double_check
+        # mode; apply cleaning again to handle single-check mode or edge cases.
         cleaned_text = clean_detected_text(detected_text, self.config.character_replacements)
 
         if not cleaned_text:
-            time.sleep(1.0)
+            # Reset hash so the same frame is retried on the next loop tick
             self._last_frame_hash = None
+            time.sleep(0.5)
             return
 
-        # Solve calculative CAPTCHAs (e.g. "6-8" → "-2", "+53-208" → "-155")
-        cleaned_text = solve_math_captcha(cleaned_text)
-
-        # Check if it's a pure number (math CAPTCHA result)
-        is_pure_numeric = bool(re.match(r"^-?\d+$", cleaned_text))
-
-        if not is_pure_numeric and len(cleaned_text) < self.config.min_captcha_length:
-            time.sleep(1.0)
+        if len(cleaned_text) < self.config.min_captcha_length:
             self._last_frame_hash = None
+            time.sleep(0.5)
             return
 
         if len(cleaned_text) > self.config.max_captcha_length:
-            time.sleep(1.0)
             self._last_frame_hash = None
+            time.sleep(0.5)
             return
 
         if self._is_recent_duplicate(cleaned_text):
@@ -600,80 +745,144 @@ class ScreenOcrBot:
             print("Submission Result: Unknown (No status banner detected)")
 
     def _read_and_confirm_text(self, image: Any) -> str:
-        """Read CAPTCHA text using NVIDIA vision API with parallel verification for speed and accuracy."""
+        """Read CAPTCHA text using NVIDIA vision API with parallel verification for speed and accuracy.
+
+        Three distinct image preprocessing pipelines (see _preprocess_for_ai) are sent
+        in parallel. A majority-vote with similarity-based tiebreaker selects the best result.
+        """
         import concurrent.futures
 
         if not self.config.double_check:
             return self.nvidia.read_text(image, self._stop_event)
 
-        # Prepare the three images: original, jittered1 (2px crop), jittered2 (4px crop)
-        images = [image]
-        
-        try:
-            w, h = image.size
-            if w > 4 and h > 4:
-                images.append(image.crop((2, 2, w - 2, h - 2)))
-            else:
-                images.append(image)
-        except Exception:
-            images.append(image)
+        # Three meaningfully different preprocessings of the same image
+        # mode=0: 2× LANCZOS, mode=1: 3× + contrast, mode=2: 2× + grayscale + sharpen
+        preprocess_modes = [0, 1, 2]
 
-        try:
-            w, h = image.size
-            if w > 8 and h > 8:
-                images.append(image.crop((4, 4, w - 4, h - 4)))
-            else:
-                images.append(image)
-        except Exception:
-            images.append(image)
+        def _read_with_mode(mode: int) -> str:
+            try:
+                preprocessed = _preprocess_for_ai(image, mode)
+            except Exception:
+                preprocessed = image
+            # Each mode uses a different prompt variant to create genuine
+            # diversity in model responses, even at temperature=0
+            return self.nvidia.read_text(
+                preprocessed,
+                self._stop_event,
+                bypass_cooldown=True,
+                prompt_variant=mode,
+            )
 
         # Run all 3 reads in parallel
-        results = []
+        results = ["", "", ""]
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            # We bypass cooldown for individual parallel requests of the same frame
-            futures = [
-                executor.submit(self.nvidia.read_text, img, self._stop_event, True)
-                for img in images
-            ]
-            # Gather results in order
-            for future in futures:
+            futures = {
+                executor.submit(_read_with_mode, mode): idx
+                for idx, mode in enumerate(preprocess_modes)
+            }
+            for future in concurrent.futures.as_completed(futures):
+                idx = futures[future]
                 try:
-                    results.append(future.result())
+                    results[idx] = future.result()
                 except Exception as e:
-                    print(f"[Confirm] Parallel read error: {e}")
-                    results.append("")
+                    print(f"[Confirm] Parallel read error (mode {preprocess_modes[idx]}): {e}")
 
-        # Update last call time to now so the next loop step respects the cooldown
+        # Update last call time so the next loop step respects the cooldown
         self.nvidia._last_call_at = time.monotonic()
 
         text1, text2, text3 = results[0], results[1], results[2]
 
-        # Process and clean the results for voting
+        # Clean all results for comparison
         cleaned1 = clean_detected_text(text1, self.config.character_replacements) if text1 else ""
         cleaned2 = clean_detected_text(text2, self.config.character_replacements) if text2 else ""
         cleaned3 = clean_detected_text(text3, self.config.character_replacements) if text3 else ""
 
-        # Solve math captcha if applicable
-        cleaned1 = solve_math_captcha(cleaned1)
-        cleaned2 = solve_math_captcha(cleaned2)
-        cleaned3 = solve_math_captcha(cleaned3)
-
-        # Voting logic
+        # --- Stage 1: Exact 2-of-3 majority vote ---
         if cleaned1 and cleaned1 == cleaned2:
-            print(f"[Confirm] Parallel Agree (Run 1 & 2): '{cleaned1}'")
-            return text1
-        elif cleaned1 and cleaned1 == cleaned3:
-            print(f"[Confirm] Parallel Agree (Run 1 & 3): '{cleaned1}'")
-            return text1
-        elif cleaned2 and cleaned2 == cleaned3:
-            print(f"[Confirm] Parallel Agree (Run 2 & 3): '{cleaned2}'")
-            return text2
-        else:
-            # If no consensus, fallback to the first read if it succeeded, else second, else third
-            fallback = text1 or text2 or text3
-            fallback_cleaned = cleaned1 or cleaned2 or cleaned3
-            print(f"[Confirm] Parallel Mismatch ('{cleaned1}' vs '{cleaned2}' vs '{cleaned3}'). Best guess: '{fallback_cleaned}'")
-            return fallback
+            print(f"[Confirm] OK: '{cleaned1}' (modes 0+1 agree)")
+            return cleaned1
+        if cleaned1 and cleaned1 == cleaned3:
+            print(f"[Confirm] OK: '{cleaned1}' (modes 0+2 agree)")
+            return cleaned1
+        if cleaned2 and cleaned2 == cleaned3:
+            print(f"[Confirm] OK: '{cleaned2}' (modes 1+2 agree)")
+            return cleaned2
+
+        # --- Stage 2: Character-level majority vote then Levenshtein tiebreaker ---
+        # When all three disagree, attempt position-by-position voting first
+        # (only possible when strings share the same length), then fall back to
+        # the Levenshtein similarity tiebreaker.
+        candidates = [(cleaned1, text1), (cleaned2, text2), (cleaned3, text3)]
+        non_empty = [(c, r) for c, r in candidates if c]
+
+        if not non_empty:
+            print(f"[Confirm] Mismatch: '{cleaned1}' vs '{cleaned2}' vs '{cleaned3}' —- Best guess: ''")
+            return ""
+
+        if len(non_empty) == 1:
+            winner_cleaned, winner_raw = non_empty[0]
+            print(f"[Confirm] Mismatch: '{cleaned1}' vs '{cleaned2}' vs '{cleaned3}' —- Best guess: '{winner_cleaned}'")
+            return winner_cleaned
+
+        # Try character-level per-position majority vote when all 3 are same length
+        if len(non_empty) == 3 and len(cleaned1) == len(cleaned2) == len(cleaned3):
+            voted = []
+            for c1, c2, c3 in zip(cleaned1, cleaned2, cleaned3):
+                if c1 == c2:
+                    voted.append(c1)   # modes 0+1 agree at this position
+                elif c1 == c3:
+                    voted.append(c1)   # modes 0+2 agree at this position
+                elif c2 == c3:
+                    voted.append(c2)   # modes 1+2 agree at this position
+                else:
+                    # All 3 differ: use variant-0 (most detailed prompt) as tie
+                    voted.append(c1)
+            winner_cleaned = "".join(voted)
+            print(
+                f"[Confirm] Mismatch (char-vote): '{cleaned1}' vs '{cleaned2}' vs '{cleaned3}' "
+                f"—- Best guess: '{winner_cleaned}'"
+            )
+            return winner_cleaned
+
+        def _levenshtein(a: str, b: str) -> int:
+            """Simple O(mn) Levenshtein distance."""
+            if a == b:
+                return 0
+            if not a:
+                return len(b)
+            if not b:
+                return len(a)
+            prev = list(range(len(b) + 1))
+            for i, ca in enumerate(a):
+                curr = [i + 1]
+                for j, cb in enumerate(b):
+                    curr.append(min(
+                        prev[j + 1] + 1,   # deletion
+                        curr[j] + 1,       # insertion
+                        prev[j] + (0 if ca == cb else 1),  # substitution
+                    ))
+                prev = curr
+            return prev[-1]
+
+        def _similarity_score(candidate: str, others: list[str]) -> int:
+            """Lower total Levenshtein distance to all others = better score."""
+            return sum(_levenshtein(candidate, o) for o in others)
+
+        # Score each non-empty candidate against all three candidates
+        all_cleaned = [cleaned1, cleaned2, cleaned3]
+        scored = [
+            (_similarity_score(c, all_cleaned), len(c), c, r)
+            for c, r in non_empty
+        ]
+        # Sort: lowest distance first, then longest string as tiebreaker
+        scored.sort(key=lambda x: (x[0], -x[1]))
+        winner_cleaned = scored[0][2]
+
+        print(
+            f"[Confirm] Mismatch: '{cleaned1}' vs '{cleaned2}' vs '{cleaned3}' "
+            f"—- Best guess: '{winner_cleaned}'"
+        )
+        return winner_cleaned
 
     def _is_recent_duplicate(self, text: str) -> bool:
         now = time.monotonic()
@@ -702,15 +911,18 @@ class ScreenOcrBot:
             submit_button = self.submit_button
 
         # Ensure the text is properly copied to the clipboard
-        pyperclip.copy(text)
-        start_copy = time.monotonic()
-        while time.monotonic() - start_copy < 1.0:
+        copy_success = False
+        for attempt in range(5):
             try:
+                pyperclip.copy(text)
                 if pyperclip.paste() == text:
+                    copy_success = True
                     break
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Warning] Clipboard copy failed, retrying (attempt {attempt + 1}/5): {e}")
             time.sleep(0.05)
+        else:
+            print("[Clipboard] Warning: Could not confirm clipboard copy after retries")
 
         # Focus the input field
         pyautogui.click(*input_box)
@@ -724,8 +936,14 @@ class ScreenOcrBot:
             pyautogui.press("backspace")
             time.sleep(0.1)
 
-        # Paste the text
-        pyautogui.hotkey("ctrl", "v")
+        # Paste the text (retry up to 3 times if paste fails)
+        for _paste_attempt in range(3):
+            try:
+                pyautogui.hotkey("ctrl", "v")
+                break
+            except Exception as exc:
+                print(f"[Clipboard] Paste attempt {_paste_attempt + 1} failed: {exc}")
+                time.sleep(0.15)
         # Give emulator time to process paste and draw characters
         time.sleep(max(0.2, self.config.submit_delay_seconds))
 
