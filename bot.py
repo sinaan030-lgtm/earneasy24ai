@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import base64
 import hashlib
 import io
@@ -12,7 +11,6 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-
 import keyboard
 import pyautogui
 import pyperclip
@@ -238,9 +236,8 @@ def clean_model_output(text: str) -> str:
         # (do NOT strip underscores or other chars that are valid CAPTCHA characters)
         text = match.group(1).strip().strip("\"'` ")
     else:
-        # No structured prefix — treat as raw model output and remove markdown
-        # formatting artifacts (bold **text**, italic *text*, __underline__, etc.)
-        text = text.replace("**", "").replace("__", "").replace("*", "")
+        # No structured prefix: treat as raw model output. Preserve literal
+        # asterisks/underscores because they can be real CAPTCHA characters.
 
         # Strip common code blocks
         text = re.sub(r"^```(?:text)?", "", text, flags=re.IGNORECASE).strip()
@@ -248,7 +245,10 @@ def clean_model_output(text: str) -> str:
 
         # Strip common answer prefixes: "Answer:", "Text:", "The captcha is:", etc.
         prefix_pattern = r"^(?:the\s+)?(?:captcha|answer|text|value|solution|challenge|result)(?:\s+is)?\s*[:=-]\s*"
+        had_prefix = re.match(prefix_pattern, text, flags=re.IGNORECASE) is not None
         text = re.sub(prefix_pattern, "", text, flags=re.IGNORECASE).strip()
+        if had_prefix:
+            text = strip_outer_markdown_emphasis(text)
 
         # Strip surrounding quotes/backticks
         text = text.strip("\"'` ")
@@ -273,6 +273,17 @@ def clean_model_output(text: str) -> str:
     # Strip trailing punctuation commonly added by LLMs
     text = text.rstrip(".,!?;:")
 
+    return text
+
+
+def strip_outer_markdown_emphasis(text: str) -> str:
+    for delimiter in ("**", "__"):
+        if (
+            text.startswith(delimiter)
+            and text.endswith(delimiter)
+            and len(text) > len(delimiter) * 2
+        ):
+            return text[len(delimiter):-len(delimiter)].strip()
     return text
 
 
@@ -347,7 +358,7 @@ _PROMPT_VARIANTS = (
         "If the image is unreadable: CAPTCHA: NONE\n"
         "\n"
         "RULES:\n"
-        "1. Copy every visible character exactly as shown, left to right. This includes letters, digits, AND all special characters (%, =, @, #, $, !, +, -, etc.).\n"
+        "1. Copy every visible character exactly as shown, left to right. This includes letters, digits, AND all special characters (%, =, @, #, $, !, +, *, -, etc.).\n"
         "2. Ignore decorations only: strike-through lines, grid lines, and background noise are NOT part of the CAPTCHA answer.\n"
         "3. Case-sensitive: uppercase A-Z and lowercase a-z are DIFFERENT — preserve exactly as shown.\n"
         "4. Common look-alike pairs — choose the one that visually matches the pixel shape:\n"
@@ -376,7 +387,7 @@ _PROMPT_VARIANTS = (
         "Format: CAPTCHA: <exact_text>\n"
         "Critical:\n"
         "- Exact case required: lowercase a-z and uppercase A-Z are DIFFERENT characters\n"
-        "- Include every special symbol shown (%, =, @, #, $, !, +, etc.)\n"
+        "- Include every special symbol shown (%, =, @, #, $, !, +, *, etc.)\n"
         "- Distinguish carefully: 0 vs O, 1 vs l vs I, 5 vs S, 2 vs Z, 8 vs B\n"
         "- Ignore background lines/noise — output ONLY the actual CAPTCHA text\n"
         "Output ONLY: CAPTCHA: <exact_text>"
