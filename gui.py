@@ -578,10 +578,11 @@ class BotApp:
         add_entry("Max CAPTCHA Length", "MAX_CAPTCHA_LENGTH", "20")
 
         # Delays & Timeouts
-        add_entry("Loop Delay (sec)", "LOOP_DELAY_SECONDS", "0.15")
-        add_entry("Change Cooldown (sec)", "CHANGE_COOLDOWN_SECONDS", "3.0")
-        add_entry("Paste Delay (sec)", "PASTE_DELAY_SECONDS", "0.05")
-        add_entry("Submit Delay (sec)", "SUBMIT_DELAY_SECONDS", "0.05")
+        add_entry("Loop Delay (sec)", "LOOP_DELAY_SECONDS", "0.03")
+        add_entry("Change Cooldown (sec)", "CHANGE_COOLDOWN_SECONDS", "1.5")
+        add_entry("Paste Delay (sec)", "PASTE_DELAY_SECONDS", "0.01")
+        add_entry("Submit Delay (sec)", "SUBMIT_DELAY_SECONDS", "0.01")
+        add_entry("Status Check Interval (sec)", "STATUS_CHECK_INTERVAL_SECONDS", "0.05")
         add_entry("AI Connect Timeout (sec)", "AI_CONNECT_TIMEOUT_SECONDS", "3.0")
         add_entry("AI Read Timeout (sec)", "AI_TIMEOUT_SECONDS", "15.0")
 

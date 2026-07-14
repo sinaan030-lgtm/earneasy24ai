@@ -44,6 +44,7 @@ class Config:
     min_seconds_between_submissions: float
     paste_delay_seconds: float
     submit_delay_seconds: float
+    status_check_interval_seconds: float
     clear_input_before_paste: bool
     pyautogui_pause: float
     pyautogui_failsafe: bool
@@ -145,9 +146,9 @@ def read_config() -> Config:
 
     return Config(
         capture_region=parse_int_tuple("CAPTURE_REGION", 4, DEFAULT_CAPTURE_REGION),
-        loop_delay_seconds=env_float("LOOP_DELAY_SECONDS", 0.15),
-        change_cooldown_seconds=env_float("CHANGE_COOLDOWN_SECONDS", 3.0),
-        post_change_settle_seconds=env_float("POST_CHANGE_SETTLE_SECONDS", 0.15),
+        loop_delay_seconds=env_float("LOOP_DELAY_SECONDS", 0.03),
+        change_cooldown_seconds=env_float("CHANGE_COOLDOWN_SECONDS", 1.5),
+        post_change_settle_seconds=env_float("POST_CHANGE_SETTLE_SECONDS", 0.02),
         process_initial_frame=env_bool("PROCESS_INITIAL_FRAME", True),
         nvidia_api_url=env_str("NVIDIA_API_URL", DEFAULT_NVIDIA_API_URL),
         nvidia_model=env_str("NVIDIA_MODEL", DEFAULT_NVIDIA_MODEL),
@@ -157,20 +158,24 @@ def read_config() -> Config:
         ai_max_tokens=env_int("AI_MAX_TOKENS", 512),
         ai_fallback_min_interval_seconds=env_float(
             "AI_FALLBACK_MIN_INTERVAL_SECONDS",
-            0.5,
+            0.1,
         ),
         duplicate_text_window_seconds=env_float(
             "DUPLICATE_TEXT_WINDOW_SECONDS",
-            10.0,
+            5.0,
         ),
         min_seconds_between_submissions=env_float(
             "MIN_SECONDS_BETWEEN_SUBMISSIONS",
-            0.7,
+            0.3,
         ),
-        paste_delay_seconds=env_float("PASTE_DELAY_SECONDS", 0.05),
-        submit_delay_seconds=env_float("SUBMIT_DELAY_SECONDS", 0.05),
+        paste_delay_seconds=env_float("PASTE_DELAY_SECONDS", 0.01),
+        submit_delay_seconds=env_float("SUBMIT_DELAY_SECONDS", 0.01),
+        status_check_interval_seconds=env_float(
+            "STATUS_CHECK_INTERVAL_SECONDS",
+            0.05,
+        ),
         clear_input_before_paste=env_bool("CLEAR_INPUT_BEFORE_PASTE", True),
-        pyautogui_pause=env_float("PYAUTOGUI_PAUSE", 0.02),
+        pyautogui_pause=env_float("PYAUTOGUI_PAUSE", 0.005),
         pyautogui_failsafe=env_bool("PYAUTOGUI_FAILSAFE", True),
         min_captcha_length=env_int("MIN_CAPTCHA_LENGTH", 6),
         max_captcha_length=env_int("MAX_CAPTCHA_LENGTH", 20),
@@ -211,7 +216,26 @@ def save_to_env(updates: dict[str, str]) -> None:
 
 
 def capture_screen(config: Config):
-    return pyautogui.screenshot(region=config.capture_region)
+    return pyautogui.screenshot(region=config.capture_region, _pause=False)
+
+
+def _detect_captcha_presence(image: Any) -> bool:
+    """Fast heuristic to skip OCR when no CAPTCHA is likely visible."""
+    try:
+        from PIL import ImageStat
+
+        img = image.convert("RGB")
+        stat = ImageStat.Stat(img)
+        avg_std_dev = sum(stat.stddev) / len(stat.stddev)
+        avg_brightness = sum(stat.mean) / len(stat.mean)
+
+        if avg_std_dev < 5:
+            return False
+        if avg_brightness < 30:
+            return False
+        return True
+    except Exception:
+        return True
 
 
 def frame_hash(image: Any) -> str:
@@ -301,7 +325,8 @@ def clean_detected_text(text: str, replacements: dict[str, str] = None) -> str:
 
 
 def duplicate_key(text: str) -> str:
-    return " ".join(text.casefold().split())
+    normalized = text.casefold().strip()
+    return "".join(normalized.split())
 
 
 def _preprocess_for_ai(image: Any, mode: int = 0) -> Any:
@@ -412,6 +437,7 @@ class NvidiaVisionClient:
         stop_event: threading.Event | None = None,
         bypass_cooldown: bool = False,
         prompt_variant: int = 0,
+        max_wait_seconds: float | None = None,
     ) -> str:
         if not self.config.nvidia_api_key:
             if not self._missing_key_reported:
@@ -434,6 +460,8 @@ class NvidiaVisionClient:
             elapsed = now - self._last_call_at
             if elapsed < self.config.ai_fallback_min_interval_seconds:
                 remaining = self.config.ai_fallback_min_interval_seconds - elapsed
+                if max_wait_seconds is not None:
+                    remaining = min(remaining, max_wait_seconds)
                 if stop_event is not None and stop_event.wait(remaining):
                     return ""
                 if stop_event is None:
@@ -685,6 +713,9 @@ class ScreenOcrBot:
 
         self._last_frame_hash = current_hash
 
+        if not _detect_captcha_presence(image):
+            return
+
         detected_text = self._read_and_confirm_text(image)
         # _read_and_confirm_text already returns a cleaned string in double_check
         # mode; apply cleaning again to handle single-check mode or edge cases.
@@ -753,7 +784,7 @@ class ScreenOcrBot:
             except Exception:
                 # Sometimes pyautogui.pixel fails if coordinates are out of bounds
                 pass
-            time.sleep(0.1)
+            time.sleep(max(0.01, self.config.status_check_interval_seconds))
 
         if detected_status:
             print(f"Submission Result: {detected_status}")
@@ -787,6 +818,7 @@ class ScreenOcrBot:
                 self._stop_event,
                 bypass_cooldown=True,
                 prompt_variant=mode,
+                max_wait_seconds=8.0,
             )
 
         # Run all 3 reads in parallel
@@ -936,21 +968,21 @@ class ScreenOcrBot:
                     break
             except Exception as e:
                 print(f"[Warning] Clipboard copy failed, retrying (attempt {attempt + 1}/5): {e}")
-            time.sleep(0.05)
+            time.sleep(max(0.01, self.config.paste_delay_seconds))
         else:
             print("[Clipboard] Warning: Could not confirm clipboard copy after retries")
 
         # Focus the input field
         pyautogui.click(*input_box)
         # Give emulator/OS time to focus window and input field
-        time.sleep(max(0.2, self.config.paste_delay_seconds))
+        time.sleep(max(0.01, self.config.paste_delay_seconds))
 
         # Clear existing text reliably
         if self.config.clear_input_before_paste:
             pyautogui.hotkey("ctrl", "a")
-            time.sleep(0.1)
+            time.sleep(max(0.01, self.config.paste_delay_seconds))
             pyautogui.press("backspace")
-            time.sleep(0.1)
+            time.sleep(max(0.01, self.config.paste_delay_seconds))
 
         # Paste the text (retry up to 3 times if paste fails)
         for _paste_attempt in range(3):
@@ -959,9 +991,9 @@ class ScreenOcrBot:
                 break
             except Exception as exc:
                 print(f"[Clipboard] Paste attempt {_paste_attempt + 1} failed: {exc}")
-                time.sleep(0.15)
+                time.sleep(max(0.01, self.config.paste_delay_seconds))
         # Give emulator time to process paste and draw characters
-        time.sleep(max(0.2, self.config.submit_delay_seconds))
+        time.sleep(max(0.01, self.config.submit_delay_seconds))
 
         # Click submit
         pyautogui.click(*submit_button)
