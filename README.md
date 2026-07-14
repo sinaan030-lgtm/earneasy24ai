@@ -31,7 +31,9 @@ OCR modes:
 - `accurate`: EasyOCR first, then NVIDIA verification when an API key is set.
 - `hybrid`: EasyOCR first, NVIDIA fallback only when EasyOCR returns nothing.
 - `easyocr`: EasyOCR only.
-- `nvidia`: NVIDIA vision API for every processed screenshot.
+- `nvidia`: NVIDIA OCR model for every processed screenshot.
+
+For NVIDIA OCR, use `NVIDIA_MODEL=nvidia/nemotron-ocr-v2`.
 
 ## Calibrate
 

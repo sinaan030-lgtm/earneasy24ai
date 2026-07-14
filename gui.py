@@ -573,11 +573,7 @@ class BotApp:
 
         # Add Configuration Inputs
         add_entry("NVIDIA API Key", "NVIDIA_API_KEY", "", show_mask="*")
-        add_entry(
-            "NVIDIA Vision Model",
-            "NVIDIA_MODEL",
-            "nvidia/llama-3.1-nemotron-nano-vl-8b-v1",
-        )
+        add_entry("NVIDIA OCR Model", "NVIDIA_MODEL", "nvidia/nemotron-ocr-v2")
         add_entry("Min CAPTCHA Length", "MIN_CAPTCHA_LENGTH", "6")
         add_entry("Max CAPTCHA Length", "MAX_CAPTCHA_LENGTH", "20")
 

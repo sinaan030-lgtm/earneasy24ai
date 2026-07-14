@@ -23,7 +23,7 @@ DEFAULT_SUBMIT_BUTTON = (200, 400)
 DEFAULT_STATUS_POINT = (0, 0)
 
 DEFAULT_NVIDIA_API_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-DEFAULT_NVIDIA_MODEL = "nvidia/llama-3.1-nemotron-nano-vl-8b-v1"
+DEFAULT_NVIDIA_MODEL = "nvidia/nemotron-ocr-v2"
 
 
 @dataclass(frozen=True)
@@ -465,8 +465,13 @@ class NvidiaVisionClient:
             "stream": False,
         }
 
+        attempts = 1 if bypass_cooldown else 3
+        timeout_seconds = self.config.ai_timeout_seconds
+        if bypass_cooldown:
+            timeout_seconds = min(timeout_seconds, 15.0)
+
         success = False
-        for attempt in range(1, 4):
+        for attempt in range(1, attempts + 1):
             try:
                 response = requests.post(
                     self.config.nvidia_api_url,
@@ -478,7 +483,7 @@ class NvidiaVisionClient:
                     json=payload,
                     timeout=(
                         self.config.ai_connect_timeout_seconds,
-                        self.config.ai_timeout_seconds,
+                        timeout_seconds,
                     ),
                 )
                 response.raise_for_status()
@@ -496,7 +501,7 @@ class NvidiaVisionClient:
             except Exception as exc:
                 # We only print individual attempt failures if the circuit breaker hasn't kicked in
                 print(f"[NVIDIA] Attempt {attempt} failed: {exc}")
-                if attempt < 3:
+                if attempt < attempts:
                     if stop_event is not None and stop_event.wait(1.0):
                         return ""
                     elif stop_event is None:
@@ -587,7 +592,7 @@ class ScreenOcrBot:
             self._worker = threading.Thread(target=self._run, daemon=True)
             self._worker.start()
 
-        print("Bot started (NVIDIA vision mode)")
+        print("Bot started (NVIDIA OCR mode)")
 
     def stop(self) -> None:
         self._stop_event.set()
