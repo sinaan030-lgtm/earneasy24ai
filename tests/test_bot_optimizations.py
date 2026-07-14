@@ -16,7 +16,20 @@ sys.modules.setdefault("pyautogui", types.SimpleNamespace(
 sys.modules.setdefault("keyboard", types.SimpleNamespace(add_hotkey=lambda *args, **kwargs: None, wait=lambda: None))
 sys.modules.setdefault("pyperclip", types.SimpleNamespace(copy=lambda *args, **kwargs: None, paste=lambda *args, **kwargs: ""))
 
-from bot import _detect_captcha_presence, duplicate_key
+from bot import _detect_captcha_presence, capture_screen, duplicate_key
+
+
+def test_capture_screen_falls_back_for_pyautogui_versions_without_pause_kwarg():
+    class CompatPyAutoGUI:
+        def screenshot(self, *args, **kwargs):
+            if "_pause" in kwargs:
+                raise TypeError("unexpected keyword argument '_pause'")
+            return "ok"
+
+    import bot
+
+    bot.pyautogui = CompatPyAutoGUI()
+    assert capture_screen(type("Config", (), {"capture_region": (0, 0, 1, 1)})()) == "ok"
 
 
 def test_detect_captcha_presence_rejects_blank_image():

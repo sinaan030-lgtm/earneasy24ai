@@ -216,7 +216,12 @@ def save_to_env(updates: dict[str, str]) -> None:
 
 
 def capture_screen(config: Config):
-    return pyautogui.screenshot(region=config.capture_region, _pause=False)
+    try:
+        return pyautogui.screenshot(region=config.capture_region, _pause=False)
+    except TypeError as exc:
+        if "_pause" in str(exc):
+            return pyautogui.screenshot(region=config.capture_region)
+        raise
 
 
 def _detect_captcha_presence(image: Any) -> bool:
