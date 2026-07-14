@@ -11,9 +11,30 @@ import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-import keyboard
-import pyautogui
-import pyperclip
+try:
+    import keyboard
+except Exception as exc:  # pragma: no cover - depends on runtime environment
+    keyboard = None
+    _keyboard_import_error = exc
+else:
+    _keyboard_import_error = None
+
+try:
+    import pyautogui
+except Exception as exc:  # pragma: no cover - depends on runtime environment
+    pyautogui = None
+    _pyautogui_import_error = exc
+else:
+    _pyautogui_import_error = None
+
+try:
+    import pyperclip
+except Exception as exc:  # pragma: no cover - depends on runtime environment
+    pyperclip = None
+    _pyperclip_import_error = exc
+else:
+    _pyperclip_import_error = None
+
 import requests
 
 
@@ -213,6 +234,34 @@ def save_to_env(updates: dict[str, str]) -> None:
     # Reflect changes immediately in os.environ so read_config() picks them up
     for key, val in updates.items():
         os.environ[key] = val
+
+
+class _DependencyProxy:
+    def __init__(self, module: Any, module_name: str, import_error: Exception | None) -> None:
+        self._module = module
+        self._module_name = module_name
+        self._import_error = import_error
+
+    def _require(self) -> Any:
+        if self._module is None:
+            raise RuntimeError(
+                f"{self._module_name} is unavailable: {self._import_error}"
+            ) from self._import_error
+        return self._module
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._require(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"_module", "_module_name", "_import_error"}:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._require(), name, value)
+
+
+pyautogui = _DependencyProxy(pyautogui, "pyautogui", _pyautogui_import_error)
+keyboard = _DependencyProxy(keyboard, "keyboard", _keyboard_import_error)
+pyperclip = _DependencyProxy(pyperclip, "pyperclip", _pyperclip_import_error)
 
 
 def capture_screen(config: Config):
